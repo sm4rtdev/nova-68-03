@@ -3,6 +3,8 @@ os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 
 import sys
 import json
+import traceback
+import time
 
 import bittensor as bt
 import pandas as pd
@@ -16,8 +18,10 @@ sys.path.append(PARENT_DIR)
 
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
 
-from nova_ph2.PSICHIC.wrapper import PsichicWrapper
+from nova_ph2.neurons.validator.scoring import score_molecules_json
+import nova_ph2.neurons.validator.scoring as scoring_module
 from random_sampler import run_sampler
+from nova_ph2.combinatorial_db.reactions import get_smiles_from_reaction
 
 DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
 
@@ -32,6 +36,7 @@ def get_config(input_file: os.path = os.path.join(BASE_DIR, "input.json")):
 
 def iterative_sampling_loop(
     db_path: str,
+    sampler_file_path: str,
     output_path: str,
     config: dict,
     save_all_scores: bool = False
@@ -43,32 +48,24 @@ def iterative_sampling_loop(
       3) Merge with previous top x, deduplicate, sort, select top x
       4) Write top x to file (overwrite) each iteration
     """
-    target_models = []
-    antitarget_models = []
-
-    for seq in config["target_sequences"]:
-        wrapper = PsichicWrapper()
-        wrapper.initialize_model(seq)
-        target_models.append(wrapper)
-    for seq in config["antitarget_sequences"]:
-        wrapper = PsichicWrapper()
-        wrapper.initialize_model(seq)
-        antitarget_models.append(wrapper)
-
     n_samples = config["num_molecules"] * 5
-    n_samples_first_iteration = n_samples if config["allowed_reaction"] == "rxn:5" else n_samples * 4
 
     top_pool = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
     seen_inchikeys = set()
 
     iteration = 0
     mutation_prob = 0.1
-    elite_frac = 0.25
+    elite_frac = 0.5
 
     while True:
         iteration += 1
-        sampler_data = run_sampler(n_samples=n_samples_first_iteration if iteration == 1 else n_samples, 
+        bt.logging.info(f"[Miner] Iteration {iteration}: sampling {n_samples} molecules")
+
+        sampler_data = run_sampler(
+                        n_samples=n_samples*4 if iteration == 1 else n_samples, 
                         subnet_config=config, 
+                        output_path=sampler_file_path,
+                        save_to_file=True,
                         db_path=db_path,
                         elite_names=top_pool["name"].tolist() if not top_pool.empty else None,
                         elite_frac=elite_frac,
@@ -80,49 +77,53 @@ def iterative_sampling_loop(
             bt.logging.warning("[Miner] No valid molecules produced; continuing")
             continue
 
-        names = sampler_data["molecules"]
-        smiles = sampler_data["smiles"]
-        filtered_names = []
-        filtered_smiles = []
-        for name, smile in zip(names, smiles):
-            try:
-                mol = Chem.MolFromSmiles(smile)
-                if not mol:
+        try:
+            names = sampler_data["molecules"]
+            filtered_names = []
+            for name in names:
+                try:
+                    s = get_smiles_from_reaction(name)
+                    if not s:
+                        continue
+                    mol = Chem.MolFromSmiles(s)
+                    if not mol:
+                        continue
+                    key = Chem.MolToInchiKey(mol)
+                    if key in seen_inchikeys:
+                        continue
+                    filtered_names.append(name)
+                except Exception:
                     continue
-                key = Chem.MolToInchiKey(mol)
-                if key in seen_inchikeys:
-                    continue
-                filtered_names.append(name)
-                filtered_smiles.append(smile)
-            except Exception:
+
+            if not filtered_names:
+                bt.logging.warning("All sampled molecules were previously seen; continuing")
                 continue
 
-        if not filtered_names:
+            if len(filtered_names) < len(names):
+                bt.logging.warning(f"{len(names) - len(filtered_names)} molecules were previously seen; continuing with unseen only")
+
+            dup_ratio = (len(names) - len(filtered_names)) / max(1, len(names))
+            if dup_ratio > 0.62:
+                mutation_prob = min(0.5, mutation_prob * 1.5)
+                elite_frac = max(0.2, elite_frac * 0.8)
+            elif dup_ratio < 0.22 and not top_pool.empty:
+                mutation_prob = max(0.05, mutation_prob * 0.9)
+                elite_frac = min(0.8, elite_frac * 1.1)
+
+            sampler_data = {"molecules": filtered_names}
+            with open(sampler_file_path, "w") as f:
+                json.dump(sampler_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            bt.logging.warning(f"[Miner] Pre-score deduplication failed; proceeding unfiltered: {e}")
+
+        score_dict = score_molecules_json(sampler_file_path, 
+                                         config["target_sequences"], 
+                                         config["antitarget_sequences"], 
+                                         config)
+        # Calculate middle scores
+        if not score_dict:
+            bt.logging.warning("[Miner] Scoring failed or mismatched; continuing")
             continue
-
-        dup_ratio = (len(names) - len(filtered_names)) / max(1, len(names))
-        if dup_ratio > 0.6:
-            mutation_prob = min(0.5, mutation_prob * 1.5)
-            elite_frac = max(0.2, elite_frac * 0.8)
-        elif dup_ratio < 0.2 and not top_pool.empty:
-            mutation_prob = max(0.05, mutation_prob * 0.9)
-            elite_frac = min(0.8, elite_frac * 1.1)
-
-        sampler_data = {"molecules": filtered_names, "smiles": filtered_smiles}
-
-        all_target_results = []
-        for target_model in target_models:
-            target_results = target_model.score_molecules(filtered_smiles)
-            all_target_results.append(target_results['predicted_binding_affinity'].tolist())
-        all_antitarget_results = []
-        for antitarget_model in antitarget_models:
-            antitarget_results = antitarget_model.score_molecules(filtered_smiles)
-            all_antitarget_results.append(antitarget_results['predicted_binding_affinity'].tolist())
-
-        score_dict = {
-            'ps_target_scores': all_target_results,
-            'ps_antitarget_scores': all_antitarget_results,
-        }
 
         # Calculate final scores per molecule
         batch_scores = calculate_final_scores(score_dict, sampler_data, config, save_all_scores)
@@ -151,14 +152,14 @@ def iterative_sampling_loop(
 def calculate_final_scores(score_dict: dict, 
         sampler_data: dict, 
         config: dict, 
-        save_all_scores: bool = False,
+        save_all_scores: bool = True,
         current_epoch: int = 0) -> pd.DataFrame:
     """
     Calculate final scores per molecule
     """
 
     names = sampler_data["molecules"]
-    smiles = sampler_data["smiles"]
+    smiles = [get_smiles_from_reaction(name) for name in names]
 
     # Calculate InChIKey for each molecule to deduplicate molecules after merging
     inchikey_list = []
@@ -171,8 +172,8 @@ def calculate_final_scores(score_dict: dict,
             inchikey_list.append(None)
 
     # Calculate final scores for each molecule
-    targets = score_dict['ps_target_scores']
-    antitargets = score_dict['ps_antitarget_scores']
+    targets = score_dict[0]['target_scores']
+    antitargets = score_dict[0]['antitarget_scores']
     final_scores = []
     for mol_idx in range(len(names)):
         # target average
@@ -195,11 +196,22 @@ def calculate_final_scores(score_dict: dict,
         "score": final_scores
     })
 
+    if save_all_scores:
+        all_scores = {"scored_molecules": [(mol["name"], mol["score"]) for mol in batch_scores.to_dict(orient="records")]}
+        all_scores_path = os.path.join(OUTPUT_DIR, f"all_scores_{current_epoch}.json")
+        if os.path.exists(all_scores_path):
+            with open(all_scores_path, "r") as f:
+                all_previous_scores = json.load(f)
+            all_scores["scored_molecules"] = all_previous_scores["scored_molecules"] + all_scores["scored_molecules"]
+        with open(all_scores_path, "w") as f:
+            json.dump(all_scores, f, ensure_ascii=False, indent=2)
+
     return batch_scores
 
 def main(config: dict):
     iterative_sampling_loop(
         db_path=DB_PATH,
+        sampler_file_path=os.path.join(OUTPUT_DIR, "sampler_file.json"),
         output_path=os.path.join(OUTPUT_DIR, "result.json"),
         config=config,
         save_all_scores=True,
