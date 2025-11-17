@@ -197,16 +197,6 @@ def calculate_final_scores(score_dict: dict,
 
     return batch_scores
 
-    # if save_all_scores:
-    #     all_scores = {"scored_molecules": [(mol["name"], mol["score"]) for mol in batch_scores.to_dict(orient="records")]}
-    #     all_scores_path = os.path.join(OUTPUT_DIR, f"all_scores_{current_epoch}.json")
-    #     if os.path.exists(all_scores_path):
-    #         with open(all_scores_path, "r") as f:
-    #             all_previous_scores = json.load(f)
-    #         all_scores["scored_molecules"] = all_previous_scores["scored_molecules"] + all_scores["scored_molecules"]
-    #     with open(all_scores_path, "w") as f:
-    #         json.dump(all_scores, f, ensure_ascii=False, indent=2)
-
 def main(config: dict):
     iterative_sampling_loop(
         db_path=DB_PATH,
