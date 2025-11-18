@@ -216,8 +216,6 @@ def main(config: dict):
         config=config,
         save_all_scores=True,
     )
- 
-
 if __name__ == "__main__":
     config = get_config()
     main(config)
